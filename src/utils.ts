@@ -299,3 +299,32 @@ export async function logout(page: Page, debugLog: string[]): Promise<void> {
     // best effort — browser.close() ends the session anyway
   }
 }
+
+/**
+ * Etiqueta legible "Mes Año" a partir de una fecha dd-mm-yyyy o dd/mm/yyyy.
+ * La usan los scrapers para nombrar periodos de facturación de tarjetas.
+ */
+export function monthYearLabel(ddmmyyyy: string): string {
+  const MONTH_NAMES = ["Enero", "Febrero", "Marzo", "Abril", "Mayo", "Junio", "Julio", "Agosto", "Septiembre", "Octubre", "Noviembre", "Diciembre"];
+  const parts = ddmmyyyy.split(/[-/]/);
+  const mm = parseInt(parts.length >= 2 ? parts[1] : "0", 10);
+  const yyyy = parts.length >= 3 ? parts[2] : new Date().getFullYear().toString();
+  return `${MONTH_NAMES[(mm - 1) % 12] || "?"} ${yyyy}`;
+}
+
+/**
+ * Deduplica movimientos que llegan por más de una vía (ej: el mismo cargo
+ * aparece como no facturado y como facturado). Ante un empate se prefiere la
+ * versión facturada, que es la que el banco ya consolidó.
+ */
+export function deduplicateAcrossSources(movements: BankMovement[]): BankMovement[] {
+  const seen = new Map<string, BankMovement>();
+  for (const m of movements) {
+    const key = `${m.date}|${m.description}|${m.amount}`;
+    const existing = seen.get(key);
+    if (!existing || m.source === "credit_card_billed") {
+      seen.set(key, m);
+    }
+  }
+  return [...seen.values()];
+}
