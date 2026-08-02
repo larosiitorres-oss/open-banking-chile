@@ -1,6 +1,6 @@
 import { describe, it, expect } from "vitest";
 import { MOVEMENT_SOURCE } from "../types.js";
-import { normalizeBciApiMovements } from "./bci.js";
+import { normalizeBciApiMovements, TC_COMBINATIONS } from "./bci.js";
 
 describe("normalizeBciApiMovements", () => {
   it("returns empty array for empty captures", () => {
@@ -88,5 +88,31 @@ describe("normalizeBciApiMovements", () => {
     const result = normalizeBciApiMovements([makeCapture("A"), makeCapture("B")]);
     expect(result).toHaveLength(2);
     expect(result.map((m) => m.description)).toEqual(["A", "B"]);
+  });
+});
+
+describe("TC_COMBINATIONS currency mapping", () => {
+  it("tags the Internacional USD tabs with USD", () => {
+    const international = TC_COMBINATIONS.filter((c) => c.tab === "Internacional USD");
+    expect(international).toHaveLength(2);
+    for (const combo of international) {
+      expect(combo.currency).toBe("USD");
+    }
+  });
+
+  it("leaves the Nacional tabs without a currency (⇒ CLP)", () => {
+    const national = TC_COMBINATIONS.filter((c) => c.tab === "Nacional $");
+    expect(national).toHaveLength(2);
+    for (const combo of national) {
+      expect(combo.currency).toBeUndefined();
+    }
+  });
+
+  it("covers both billing types for each tab", () => {
+    expect(TC_COMBINATIONS).toHaveLength(4);
+    const billed = TC_COMBINATIONS.filter((c) => c.source === MOVEMENT_SOURCE.credit_card_billed);
+    const unbilled = TC_COMBINATIONS.filter((c) => c.source === MOVEMENT_SOURCE.credit_card_unbilled);
+    expect(billed).toHaveLength(2);
+    expect(unbilled).toHaveLength(2);
   });
 });
