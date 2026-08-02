@@ -31,9 +31,16 @@ const ISO_CURRENCY_BY_NUMERIC: Record<number, string> = {
 
 function resolveUnbilledCurrency(mov: ApiMovNoFactur): string | undefined {
   if (mov.origenTransaccion !== "INT") return undefined;
-  const alpha = mov.codigoMonedaOrigen !== undefined ? ISO_CURRENCY_BY_NUMERIC[mov.codigoMonedaOrigen] : undefined;
-  // Fallback: si es INT pero no reconocemos el código, asumir USD (caso más común en TC chilenas).
-  return alpha && alpha !== "CLP" ? alpha : "USD";
+  if (mov.codigoMonedaOrigen !== undefined) {
+    const alpha = ISO_CURRENCY_BY_NUMERIC[mov.codigoMonedaOrigen];
+    // El banco dijo explícitamente la moneda: respetarla. Un comercio
+    // internacional que cobra en pesos (152) es CLP, no USD — marcarlo como
+    // USD inflaría el monto ~900x, peor que el bug original.
+    if (alpha) return alpha === "CLP" ? undefined : alpha;
+  }
+  // Solo si el banco NO informó código (o es desconocido) asumimos USD, que
+  // es la moneda de la enorme mayoría de las compras internacionales con TC chilena.
+  return "USD";
 }
 interface ApiNoFacturResponse { fechaProximaFacturacionCalendario: string; fechaProximoVencimiento?: string; fechaVencimiento?: string; gastosPeriodo?: number; montoGastosPeriodo?: number; listaMovNoFactur: ApiMovNoFactur[]; }
 interface ApiFechaFacturacion { fechaFacturacion: string; existeEstadoCuentaNacional: string; existeEstadoCuentaInternacional: string; }
