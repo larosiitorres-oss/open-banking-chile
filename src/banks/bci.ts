@@ -59,11 +59,14 @@ const TWO_FACTOR_CONFIG = {
   timeoutEnvVar: "BCI_2FA_TIMEOUT_SEC",
 };
 
-const TC_COMBINATIONS = [
-  { tab: "Nacional $", billingType: "No facturados", source: MOVEMENT_SOURCE.credit_card_unbilled },
-  { tab: "Nacional $", billingType: "Facturados", source: MOVEMENT_SOURCE.credit_card_billed },
-  { tab: "Internacional USD", billingType: "No facturados", source: MOVEMENT_SOURCE.credit_card_unbilled },
-  { tab: "Internacional USD", billingType: "Facturados", source: MOVEMENT_SOURCE.credit_card_billed },
+// `currency` queda undefined para las pestañas nacionales (⇒ CLP) y es "USD"
+// para las internacionales: BCI separa los movimientos por moneda en pestañas
+// distintas, así que la pestaña de origen ES la fuente de verdad de la moneda.
+export const TC_COMBINATIONS = [
+  { tab: "Nacional $", billingType: "No facturados", source: MOVEMENT_SOURCE.credit_card_unbilled, currency: undefined },
+  { tab: "Nacional $", billingType: "Facturados", source: MOVEMENT_SOURCE.credit_card_billed, currency: undefined },
+  { tab: "Internacional USD", billingType: "No facturados", source: MOVEMENT_SOURCE.credit_card_unbilled, currency: "USD" },
+  { tab: "Internacional USD", billingType: "Facturados", source: MOVEMENT_SOURCE.credit_card_billed, currency: "USD" },
 ];
 
 const NEXT_PAGE_TEXTS = ["navigate_next", "siguiente"];
@@ -227,6 +230,7 @@ async function extractTCMovements(
   billingType: string,
   source: MovementSource,
   debugLog: string[],
+  currency?: string,
 ): Promise<BankMovement[]> {
 
   // ── FASE 1: Seleccionar pestaña (Nacional $ / Internacional USD) ────────────
@@ -321,6 +325,7 @@ async function extractTCMovements(
         amount: r.isCargo ? -absAmount : absAmount,
         balance: 0,
         source,
+        ...(currency && { currency }),
       });
     }
 
@@ -493,8 +498,8 @@ async function scrapeBci(session: BrowserSession, options: ScraperOptions): Prom
       const tcFrame = await waitForFrame(page, IFRAME_PATTERNS.tcMovements, 15000);
       if (tcFrame) {
         await delay(3000);
-        for (const { tab, billingType, source } of TC_COMBINATIONS) {
-          const movements = await extractTCMovements(tcFrame, tab, billingType, source, debugLog);
+        for (const { tab, billingType, source, currency } of TC_COMBINATIONS) {
+          const movements = await extractTCMovements(tcFrame, tab, billingType, source, debugLog, currency);
           allMovements.push(...movements);
         }
       }
