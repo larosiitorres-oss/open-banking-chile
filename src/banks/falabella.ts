@@ -910,100 +910,569 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     await delay(1000);
     await doSave(page, "01-homepage");
 
-    // 2. Click "Mi cuenta" — triggers a full-page navigation which destroys the
-    // page.evaluate() context mid-call. We catch that, then wait for the login
-    // form to be fully rendered (Angular finishes its API calls).
-    debugLog.push("2. Clicking 'Mi cuenta'...");
-    progress("Ingresando a Mi cuenta...");
-    try {
-      await clickByText(page, ["Mi cuenta"], "a, button");
-    } catch { /* context destroyed mid-navigation — expected */ }
-    // Wait for network to settle AND for the RUT input to be ready
-    // (Angular may still be initializing the form when networkIdle fires)
-    await page.waitForNetworkIdle({ idleTime: 1000, timeout: 15000 }).catch(() => {});
-    await delay(3000);
+    // 2-6. Login.
+    //
+    // PATCH (miaufinanzas, 2026 redesign): Banco Falabella's homepage no longer
+    // navigates to a /login page. Clicking "Mi cuenta" (button #btn-auth-normal)
+    // opens an INLINE auth widget on the same homepage. The old flow
+    // (clickByText "Mi cuenta" → expect navigation → generic fillRut/fillPassword/
+    // clickSubmit) silently failed: it stayed on the public homepage, typed the
+    // RUT into the SEARCH box, never submitted (the real submit button
+    // #desktop-login has no visible text and no type="submit" attribute, so the
+    // generic clickSubmit missed it and fell back to Enter, which does not submit
+    // this React form), then declared "Login OK" because no error element was
+    // present — returning 0 movements. The structure below was verified against
+    // the live site:
+    //   - RUT field:    input[placeholder*="RUT"] (visible), maxlength=10. Typing
+    //                   the CLEAN rut (digits + DV) lets the bank auto-insert the
+    //                   dash, e.g. "111111111" -> "11111111-1".
+    //   - Clave field:  input[type=password] placeholder "Clave Internet", max 6.
+    //   - Submit:       #desktop-login, `disabled` until both fields validate.
+    debugLog.push("2. Opening 'Mi cuenta' inline auth form...");
+    progress("Abriendo formulario de ingreso...");
+
+    // Dismiss the welcome modal ("Entendido", #btn-login-client-nuevo) and let
+    // dismissBanners clear any cookie/promo banner that could intercept clicks.
+    await page.evaluate(() => {
+      const el = document.getElementById("btn-login-client-nuevo");
+      if (el) (el as HTMLElement).click();
+    }).catch(() => {});
+    await dismissBanners(page).catch(() => {});
+    await delay(500);
+
+    // Open the auth widget via a DOM click (bypasses any visual overlay).
+    await page.evaluate(() => {
+      const byId = document.getElementById("btn-auth-normal");
+      if (byId) { (byId as HTMLElement).click(); return; }
+      for (const b of Array.from(document.querySelectorAll("button, a"))) {
+        if (((b as HTMLElement).innerText || "").trim().toLowerCase() === "mi cuenta") {
+          (b as HTMLElement).click();
+          return;
+        }
+      }
+    }).catch(() => {});
+
+    // Wait for the auth form's RUT field to render.
+    await page.waitForFunction(() => {
+      return Array.from(document.querySelectorAll("input")).some(
+        (i) => (i as HTMLInputElement).offsetParent !== null && /rut/i.test((i as HTMLInputElement).placeholder || ""),
+      );
+    }, { timeout: 15000 }).catch(() => {});
+    await delay(800);
     await doSave(page, "02-login-form");
 
-    // 3-5. Login
+    // 3. Fill RUT into the auth form's RUT field (NOT the search box). Mark it
+    //    with a data attribute so we can grab the exact element handle.
     debugLog.push("3. Filling RUT...");
     progress("Ingresando RUT...");
-    if (!(await fillRut(page, rut))) {
+    const cleanRut = String(rut).replace(/[.\-]/g, "").toUpperCase();
+    const rutMarked = await page.evaluate(() => {
+      const ins = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
+      for (const i of ins) {
+        if (i.offsetParent !== null && /rut/i.test(i.placeholder || "")) {
+          i.setAttribute("data-obc-rut", "1");
+          return true;
+        }
+      }
+      return false;
+    });
+    if (!rutMarked) {
       const ss = await page.screenshot({ encoding: "base64" });
-      return { success: false, bank, accounts: [], error: "No se encontró campo de RUT", screenshot: ss as string, debug: debugLog.join("\n") };
+      return { success: false, bank, accounts: [], error: "No se encontró el campo de RUT (el formulario de ingreso no se abrió)", screenshot: ss as string, debug: debugLog.join("\n") };
     }
-    await delay(1500);
+    const rutHandle = await page.$('input[data-obc-rut="1"]');
 
-    // Falabella login is a two-step modal on the same page (no navigation):
-    // Step 1: fill RUT → click "Continuar" (or press Enter) → password field appears
-    // Step 2: fill password
-    debugLog.push("4. Filling password...");
+    // 4. Locate the Clave Internet field (single-step form; tolerate two-step).
+    //
+    // PATCH (miaufinanzas): the old code checked ONCE, pressed Enter, waited a
+    // fixed 1.2s and checked ONCE more — then gave up with "No se encontró el
+    // campo de clave". On slower machines (the self-hosted MacBook runner) the
+    // inline auth form renders the password input a moment later, so this was
+    // flaky: ~2 of 5 accounts failed per run, and some only succeeded on the
+    // retry. Now we POLL for the field (up to 15s) instead of giving up early.
+    debugLog.push("4. Locating password field...");
     progress("Ingresando clave...");
-    // Advance step 1 → step 2: press Enter on the RUT field
-    await page.keyboard.press("Enter");
-    debugLog.push("  Pressed Enter to advance step 1");
-    // Wait for password field to become visible (modal transitions from step 1 → 2)
-    try {
+    const markPwd = () => page.evaluate(() => {
+      const ps = Array.from(document.querySelectorAll('input[type="password"]')) as HTMLInputElement[];
+      for (const p of ps) { if (p.offsetParent !== null) { p.setAttribute("data-obc-pwd", "1"); return true; } }
+      return false;
+    });
+    let pwdMarked = await markPwd();
+    if (!pwdMarked) {
+      // Some variants reveal the password step only after Enter on the RUT field.
+      await page.keyboard.press("Enter").catch(() => {});
       await page.waitForFunction(() => {
-        const pwd = document.querySelector('input[type="password"], input[placeholder*="Clave"], input[placeholder*="clave"]') as HTMLInputElement | null;
-        return pwd !== null && pwd.offsetParent !== null;
-      }, { timeout: 15000 });
-    } catch { /* field may appear with different timing */ }
-    await delay(500);
-    const passOk = await fillPassword(page, password);
-    if (!passOk) {
-      const ss = await page.screenshot({ encoding: "base64" });
-      return { success: false, bank, accounts: [], error: "No se encontró campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
+        return Array.from(document.querySelectorAll('input[type="password"]'))
+          .some((p) => (p as HTMLInputElement).offsetParent !== null);
+      }, { timeout: 15000, polling: 500 }).catch(() => {});
+      pwdMarked = await markPwd();
     }
-    await delay(1000);
+    debugLog.push(`  Password field found: ${pwdMarked}`);
+    if (!pwdMarked || !rutHandle) {
+      const ss = await page.screenshot({ encoding: "base64" });
+      return { success: false, bank, accounts: [], error: "No se encontró el campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
+    }
+    const pwdHandle = await page.$('input[data-obc-pwd="1"]');
 
+    // Robust fill with READ-BACK verification. Falabella's RUT field auto-formats
+    // (inserts the dash) and these React inputs occasionally drop/reorder typed
+    // characters, producing a valid-LOOKING but WRONG rut/clave — the bank then
+    // returns USER_OR_PASSWORD_NOT_VALID, or the submit button never enables.
+    // This was the root cause of the intermittent login failures. So we type,
+    // read the value back, and re-type until BOTH fields hold exactly what we
+    // intended AND the submit button has enabled.
+    const expectedPwd = String(password);
+    const fillAndRead = async (handle: any, attr: string, value: string): Promise<string> => {
+      await handle.click({ clickCount: 3 });
+      await page.keyboard.press("Backspace").catch(() => {});
+      await delay(150);
+      await handle.type(value, { delay: 80 });
+      await delay(350);
+      return await page.evaluate((a: string) => {
+        const el = document.querySelector('input[' + a + '="1"]') as HTMLInputElement | null;
+        return el ? el.value : "";
+      }, attr);
+    };
+
+    debugLog.push("4. Filling RUT + clave (with read-back verification)...");
+    let filledOk = false;
+    for (let attempt = 1; attempt <= 4 && !filledOk; attempt++) {
+      const rutVal = await fillAndRead(rutHandle, "data-obc-rut", cleanRut);
+      const pwdVal = await fillAndRead(pwdHandle, "data-obc-pwd", expectedPwd);
+      const rutMatches = rutVal.replace(/[.\-\s]/g, "").toUpperCase() === cleanRut;
+      const pwdMatches = pwdVal === expectedPwd;
+      await page.waitForFunction(() => {
+        const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+        return !!b && !b.disabled;
+      }, { timeout: 4000 }).catch(() => {});
+      const btnEnabled = await page.evaluate(() => {
+        const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+        return !!b && !b.disabled;
+      });
+      debugLog.push(`  Fill attempt ${attempt}: rutMatch=${rutMatches} pwdLen=${pwdVal.length} pwdMatch=${pwdMatches} btnEnabled=${btnEnabled}`);
+      filledOk = rutMatches && pwdMatches && btnEnabled;
+    }
+
+    // 5. Submit by clicking the real login button (#desktop-login).
     debugLog.push("5. Submitting login...");
     progress("Iniciando sesión...");
-    await clickSubmit(page, page);
-    await delay(8000);
+    const submitState = await page.evaluate(() => {
+      const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+      if (!b) return "not-found";
+      if (b.disabled) return "disabled";
+      b.click();
+      return "clicked";
+    });
+    debugLog.push(`  Submit button (#desktop-login): ${submitState} (fields verified: ${filledOk})`);
+    if (submitState !== "clicked" && pwdHandle) {
+      await pwdHandle.press("Enter");
+    }
+
+    // Wait for the post-login transition (SPA navigation or DOM swap).
+    await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 25000 }).catch(() => {});
+    await delay(5000);
     await doSave(page, "03-after-login");
 
-    // 2FA check
-    const pageContent = (await page.content()).toLowerCase();
-    if (pageContent.includes("clave dinámica") || pageContent.includes("segundo factor")) {
-      const ss = await page.screenshot({ encoding: "base64" });
-      return { success: false, bank, accounts: [], error: "El banco pide clave dinámica (2FA).", screenshot: ss as string, debug: debugLog.join("\n") };
-    }
-
-    // Login error check
-    const errorCheck = await page.evaluate(() => {
-      const els = document.querySelectorAll('[class*="error"], [class*="alert"], [role="alert"]');
-      for (const el of els) { const t = (el as HTMLElement).innerText?.trim(); if (t && t.length > 5 && t.length < 200) return t; }
-      return null;
-    });
-    if (errorCheck) {
-      const ss = await page.screenshot({ encoding: "base64" });
-      return { success: false, bank, accounts: [], error: `Error del banco: ${errorCheck}`, screenshot: ss as string, debug: debugLog.join("\n") };
-    }
-
-    debugLog.push("6. Login OK!");
-    progress("Sesión iniciada correctamente");
-    await closePopups(page);
+    await closePopups(page).catch(() => {});
     const dashboardUrl = page.url();
+
+    // 6. POSITIVE login verification — checked BEFORE any 2FA/error heuristic.
+    //    The old code declared "Login OK" merely from the ABSENCE of an error
+    //    element, so when the scraper stayed on the public homepage it still
+    //    reported success and returned 0 movements silently. We now require
+    //    evidence of an authenticated session. Doing this FIRST also avoids a
+    //    false 2FA trigger: the logged-in portal's menus contain words like
+    //    "clave"/"código" that a naive page-text match would mistake for a 2FA
+    //    wall (this actually wasted attempt #1 in testing).
+    const loginEvidence = await page.evaluate(() => {
+      const bodyText = (document.body?.innerText || "").toLowerCase();
+      const hasLogout = /cerrar sesi[oó]n/.test(bodyText)
+        || !!document.querySelector('[id*="logout" i],[class*="logout" i],[href*="logout" i],[href*="cerrarSesion" i]');
+      const hasPrivateNav = /mis productos|mis cuentas|saldo disponible|[uú]ltimos movimientos|cupo (utilizado|disponible)|estado de cuenta|transferir a terceros/.test(bodyText);
+      const looksPublic = /atr[eé]vete a ser genial|abre tu cuenta corriente|cr[eé]dito de consumo que|hazte cliente|aprovecha beneficios/.test(bodyText);
+      return { url: location.href, hasLogout, hasPrivateNav, looksPublic };
+    });
+    // The authenticated portal lives on web/web2.bancofalabella.cl/web-clientes;
+    // the public marketing site is www.bancofalabella.cl.
+    const onPrivatePortal = /\/web-clientes\b/i.test(loginEvidence.url) || /\/\/web2?\.bancofalabella\.cl/i.test(loginEvidence.url);
+    const onPublicHome = /^https?:\/\/(www\.)?bancofalabella\.cl\/?$/i.test(loginEvidence.url);
+    const loggedIn = onPrivatePortal
+      || ((loginEvidence.hasLogout || loginEvidence.hasPrivateNav) && !(onPublicHome && loginEvidence.looksPublic && !loginEvidence.hasPrivateNav));
+    debugLog.push(`6. Login check: url=${loginEvidence.url} portal=${onPrivatePortal} logout=${loginEvidence.hasLogout} privateNav=${loginEvidence.hasPrivateNav} public=${loginEvidence.looksPublic}`);
+
+    if (!loggedIn) {
+      // Not authenticated — diagnose why so the connection shows a useful error.
+      const pageContent = (await page.content()).toLowerCase();
+      if (/clave din[aá]mica|segundo factor|c[oó]digo de verificaci[oó]n/.test(pageContent)) {
+        const ss = await page.screenshot({ encoding: "base64" });
+        return { success: false, bank, accounts: [], error: "El banco pide clave dinámica (2FA).", screenshot: ss as string, debug: debugLog.join("\n") };
+      }
+      const errorCheck = await page.evaluate(() => {
+        const els = document.querySelectorAll('[class*="error"], [class*="alert"], [role="alert"]');
+        for (const el of els) {
+          const t = (el as HTMLElement).innerText?.trim();
+          if (t && t.length > 5 && t.length < 200 && /(rut|clave|incorrect|inv[aá]lid|bloque|credencial|no coincide|intenta nuevamente)/i.test(t)) return t;
+        }
+        return null;
+      });
+      const ss = await page.screenshot({ encoding: "base64" });
+      return {
+        success: false, bank, accounts: [],
+        error: errorCheck ? `Error del banco: ${errorCheck}` : "No se pudo confirmar el inicio de sesión (quedó en la página pública). Revisa credenciales o posible cambio del sitio del banco.",
+        screenshot: ss as string, debug: debugLog.join("\n"),
+      };
+    }
+
+    debugLog.push("6. Login OK! (verified)");
+    progress("Sesión iniciada correctamente");
     await doSave(page, "04-post-login");
 
     // ── Phase 1: Account movements ──────────────────────────────
+    //
+    // PATCH (miaufinanzas): rewrote this block to prioritise clicking on a
+    // REAL "Cuenta Corriente" product entry (the row with a $ balance) before
+    // falling back to clickNavTarget. The upstream behaviour was to call
+    // clickNavTarget first, which matched "Estado de Cuenta CMR" via the
+    // substring "estado de cuenta" — that navigates to the credit card
+    // statement page, NOT the checking account movements. For users with an
+    // actual checking account (e.g. Paola with "Cuenta Corriente + CMR Elite")
+    // this meant account=0 movements despite a $3M balance. We also add a
+    // handler for the "Seleccione una cuenta" modal that appears when the
+    // user has multiple checking accounts (CLP + USD).
     debugLog.push("7. [Cuenta] Looking for Cartola/Movimientos...");
     progress("Buscando cartola de cuenta...");
-    let navigated = await clickNavTarget(page, debugLog);
-    if (!navigated) {
-      const clickedAccount = await page.evaluate(() => {
-        for (const el of Array.from(document.querySelectorAll("a, div, button, tr, li"))) {
-          const text = (el as HTMLElement).innerText?.trim() || "";
-          const href = (el as HTMLAnchorElement).href || "";
-          if (href.includes("cc-nuevos") || href.includes("comenzar")) continue;
-          if ((text.toLowerCase().includes("cuenta corriente") || text.toLowerCase().includes("cuenta vista")) && text.length < 100) {
-            (el as HTMLElement).click();
-            return true;
+    let navigated = false;
+
+    // Step 7a: try to click a REAL "Cuenta Corriente / Vista" product entry.
+    //
+    // STRICT matching rules to avoid false positives (we previously matched a
+    // "Te puede interesar… Crédito pre aprobado … Con Cuenta Corriente" promo
+    // banner because it happened to contain the substring "cuenta corriente"
+    // and a $ amount):
+    //   - Text must START with "cuenta corriente" or "cuenta vista" after
+    //     trim/lowercase. That excludes promos/banners that mention the
+    //     product name mid-sentence.
+    //   - Text must contain a $ (real products always render a balance).
+    //   - Text length < 150 (real product rows are short).
+    //   - Blacklist obvious promo keywords.
+    // Hide any blocking modal/overlay. We previously tried to find a
+    // "close" button inside the modal, but that was fragile (buttons can
+    // be SVG icons, custom web components, inside shadow DOM, etc). The
+    // reliable approach is to detect overlay-like elements by their
+    // COMPUTED STYLE and force display:none on them.
+    //
+    // An overlay is identified by ALL of:
+    //   - position: fixed or absolute
+    //   - high z-index (>100)
+    //   - occupies a large chunk of the viewport (>20% of window area)
+    //   - is currently visible
+    //
+    // Those three criteria together reliably distinguish a modal/promo
+    // from regular layout containers (which are static/relative). And
+    // because we're NOT clicking anything, there's no risk of
+    // accidentally triggering logout.
+    const overlayKillResult = await page.evaluate(() => {
+      const vw = window.innerWidth;
+      const vh = window.innerHeight;
+      const vArea = vw * vh;
+      const hidden: Array<{ tag: string; cls: string; area: number; z: string }> = [];
+      const all = Array.from(document.querySelectorAll<HTMLElement>("*"));
+      for (const el of all) {
+        const s = window.getComputedStyle(el);
+        if (s.position !== "fixed" && s.position !== "absolute") continue;
+        const zIndex = parseInt(s.zIndex || "0", 10);
+        if (!Number.isFinite(zIndex) || zIndex < 100) continue;
+        if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") continue;
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) continue;
+        const area = r.width * r.height;
+        if (area < vArea * 0.2) continue;
+        // Don't hide anything that contains the main product list. Check
+        // for "cuenta corriente" text inside — if the overlay is actually
+        // the dashboard, we'd be shooting ourselves in the foot.
+        const innerText = (el.innerText || "").toLowerCase();
+        if (innerText.includes("mis productos") || /cuenta corriente\s*\n\s*\d/i.test(el.innerText || "")) continue;
+        el.style.setProperty("display", "none", "important");
+        hidden.push({ tag: el.tagName.toLowerCase(), cls: (el.className || "").slice(0, 60), area: Math.round(area), z: s.zIndex });
+      }
+      return { hidden };
+    });
+    if (overlayKillResult.hidden.length > 0) {
+      debugLog.push(`  [Overlay] Hidden ${overlayKillResult.hidden.length} blocking overlay(s):`);
+      for (const h of overlayKillResult.hidden) {
+        debugLog.push(`    ${h.tag}.${h.cls} (area=${h.area}, z=${h.z})`);
+      }
+      await delay(1500);
+    }
+
+    // DIAGNOSTIC: print all <a> elements whose href or text hints at account
+    // movements. Used to discover how to reach the right page in Falabella's
+    // Angular app without depending on the "Estado de Cuenta CMR" sidebar.
+    const linkSurvey = await page.evaluate(() => {
+      const anchors = Array.from(document.querySelectorAll<HTMLAnchorElement>("a[href]"));
+      const hits: Array<{ text: string; href: string }> = [];
+      for (const a of anchors) {
+        const href = a.href || "";
+        const text = (a.innerText || "").trim().slice(0, 60);
+        if (!href) continue;
+        if (/cartola|movimiento|cuenta|consultar|saldos/i.test(href) || /cartola|movimiento|cuenta corriente|saldos/i.test(text)) {
+          hits.push({ text, href: href.slice(0, 140) });
+        }
+      }
+      return hits.slice(0, 20);
+    });
+    debugLog.push(`  [Survey] account-related links (${linkSurvey.length}):`);
+    for (const h of linkSurvey) {
+      debugLog.push(`    "${h.text}" → ${h.href}`);
+    }
+
+    // Click strategy (in order of preference):
+    //   Pass 1: <a> / <button> / [role='button'] whose text starts with
+    //           "Cuenta Corriente/Vista". NO $ required — the real link
+    //           often has just the name + account number.
+    //   Pass 2: any DOM element whose text starts with the product name
+    //           AND contains a $. Walk up to the closest clickable
+    //           ancestor. This is the fallback for dashboards where the
+    //           actionable element is a wrapper <div> or custom component.
+    //
+    // We mark the chosen element with data-miau-click="1" and then call
+    // page.click() on that selector — Puppeteer moves a real mouse and
+    // dispatches a proper hover/focus/click sequence, which Angular
+    // handlers accept.
+    const clickTarget = await page.evaluate(() => {
+      const BLACKLIST = /(te puede interesar|pre aprobado|crédito hipotecario|línea de crédito|avance|súper avance|simula aquí|abre tu|solicita|contrata|conoce más)/i;
+      // Must be visible: non-zero box + not display:none + not visibility:hidden.
+      const isVisible = (el: HTMLElement) => {
+        const r = el.getBoundingClientRect();
+        if (r.width <= 0 || r.height <= 0) return false;
+        const s = window.getComputedStyle(el);
+        if (s.display === "none" || s.visibility === "hidden" || s.opacity === "0") return false;
+        return true;
+      };
+      // Pass 1: prefer a direct <a>/<button>/[role="button"] that is VISIBLE.
+      // Invisible anchors almost always come from collapsed dropdown menus
+      // in the header nav, not from the dashboard product list.
+      const pass1 = Array.from(document.querySelectorAll<HTMLElement>("a, button, [role='button']"));
+      for (const el of pass1) {
+        const text = (el.innerText || "").trim();
+        if (text.length === 0 || text.length > 200) continue;
+        const lower = text.toLowerCase();
+        if (!/^(cuenta corriente|cuenta vista)/.test(lower)) continue;
+        if (BLACKLIST.test(text)) continue;
+        if (!isVisible(el)) continue;
+        const href = (el as HTMLAnchorElement).href || "";
+        if (href.includes("cc-nuevos") || href.includes("comenzar")) continue;
+        el.setAttribute("data-miau-click", "1");
+        const tag = el.tagName.toLowerCase();
+        return { marked: true, text: text.slice(0, 80), tag, href: href.slice(0, 140), via: "pass1" };
+      }
+      // Pass 2: any VISIBLE element starting with the product name AND
+      // having a $ amount.
+      const candidates: Array<{ el: HTMLElement; depth: number; text: string }> = [];
+      const walk = (node: Element, depth: number) => {
+        const htmlEl = node as HTMLElement;
+        const text = (htmlEl.innerText || "").trim();
+        if (text.length > 0 && text.length <= 200) {
+          const lower = text.toLowerCase();
+          if (/^(cuenta corriente|cuenta vista)/.test(lower) && /\$/.test(text) && !BLACKLIST.test(text) && isVisible(htmlEl)) {
+            candidates.push({ el: htmlEl, depth, text });
           }
         }
-        return false;
+        for (const child of Array.from(node.children)) walk(child, depth + 1);
+      };
+      walk(document.documentElement, 0);
+      if (candidates.length === 0) return { marked: false, reason: "no-candidate" };
+      candidates.sort((a, b) => b.depth - a.depth);
+      const innermost = candidates[0];
+      let target: HTMLElement | null = innermost.el;
+      for (let hop = 0; hop < 8 && target; hop++) {
+        const style = window.getComputedStyle(target);
+        const tag = target.tagName.toLowerCase();
+        if (tag === "a" || tag === "button" || target.getAttribute("role") === "button" || target.hasAttribute("onclick") || style.cursor === "pointer") {
+          break;
+        }
+        target = target.parentElement;
+      }
+      if (!target) target = innermost.el;
+      target.setAttribute("data-miau-click", "1");
+      const href = (target as HTMLAnchorElement).href || "";
+      const tag = target.tagName.toLowerCase();
+      return { marked: true, text: innermost.text.slice(0, 80), tag, href: href.slice(0, 140), via: "pass2-depth" + innermost.depth };
+    });
+    const clickedRealAccount: { clicked: boolean; text?: string; via?: string } = { clicked: false };
+    if (clickTarget.marked) {
+      debugLog.push(`  [Account] Marked clickable via ${clickTarget.via}: tag=${clickTarget.tag} href=${clickTarget.href || "(none)"} text="${clickTarget.text}"`);
+      // Diagnostic: report the <a>'s computed style and bounding box so we
+      // can tell whether it's visible/clickable at all.
+      const meta = await page.evaluate(() => {
+        const el = document.querySelector<HTMLElement>("[data-miau-click='1']");
+        if (!el) return null;
+        el.scrollIntoView({ block: "center", inline: "center" });
+        const r = el.getBoundingClientRect();
+        const s = window.getComputedStyle(el);
+        return {
+          rect: { x: r.left, y: r.top, w: r.width, h: r.height },
+          display: s.display,
+          visibility: s.visibility,
+          opacity: s.opacity,
+          pointerEvents: s.pointerEvents,
+          parentTag: el.parentElement?.tagName.toLowerCase() || null,
+          parentClass: el.parentElement?.className || null,
+        };
       });
-      if (clickedAccount) { await delay(4000); navigated = await clickNavTarget(page, debugLog); }
+      debugLog.push(`  [Account] element meta: ${JSON.stringify(meta)}`);
+
+      if (meta && meta.rect.w > 0 && meta.rect.h > 0) {
+        // Use page.mouse.click() with real coordinates. This dispatches a
+        // TRUSTED event sequence (isTrusted=true) which Angular routers
+        // accept. Unlike page.click(selector), this doesn't do hit-testing,
+        // so hidden/overlay issues don't reject the click.
+        const cx = meta.rect.x + meta.rect.w / 2;
+        const cy = meta.rect.y + meta.rect.h / 2;
+        try {
+          await page.mouse.click(cx, cy);
+          clickedRealAccount.clicked = true;
+          clickedRealAccount.text = clickTarget.text;
+          clickedRealAccount.via = `mouse.click-${clickTarget.tag}`;
+        } catch (err) {
+          debugLog.push(`  [Account] mouse.click failed: ${err instanceof Error ? err.message : String(err)}`);
+        }
+      }
+
+      if (!clickedRealAccount.clicked) {
+        // Fallback: try Puppeteer's page.click() then in-browser el.click().
+        try {
+          await page.click("[data-miau-click='1']");
+          clickedRealAccount.clicked = true;
+          clickedRealAccount.text = clickTarget.text;
+          clickedRealAccount.via = `puppeteer-${clickTarget.tag}`;
+        } catch (err) {
+          debugLog.push(`  [Account] page.click() fallback also failed: ${err instanceof Error ? err.message : String(err)}`);
+          const inBrowserClick = await page.evaluate(() => {
+            const el = document.querySelector<HTMLElement>("[data-miau-click='1']");
+            if (!el) return false;
+            el.click();
+            return true;
+          });
+          if (inBrowserClick) {
+            clickedRealAccount.clicked = true;
+            clickedRealAccount.text = clickTarget.text;
+            clickedRealAccount.via = `in-browser-${clickTarget.tag}`;
+          }
+        }
+      }
+
+      // Clean up the marker so it doesn't interfere with later queries.
+      await page.evaluate(() => {
+        document.querySelectorAll("[data-miau-click]").forEach((el) => el.removeAttribute("data-miau-click"));
+      });
+    } else {
+      debugLog.push(`  [Account] No product candidate found (reason: ${clickTarget.reason})`);
+    }
+    if (clickedRealAccount.clicked) {
+      debugLog.push(`  [Account] Clicked product via ${clickedRealAccount.via}: ${clickedRealAccount.text}`);
+      await delay(4000);
+      debugLog.push(`  [Account] Post-click URL: ${page.url()}`);
+
+      // Step 7b: handle the "Seleccione una cuenta" modal that appears when
+      // the user has more than one checking account (e.g. CLP + USD).
+      const modalResult = await page.evaluate(() => {
+        const bodyText = document.body?.innerText || "";
+        if (!/seleccione una cuenta/i.test(bodyText)) return { handled: false, reason: "no-modal" };
+        // Scope to the modal container so we don't accidentally click items
+        // outside of it.
+        let modalRoot: HTMLElement | null = null;
+        const allContainers = Array.from(document.querySelectorAll<HTMLElement>("[role='dialog'], .modal, .mat-dialog-container, div, section"));
+        for (const el of allContainers) {
+          const t = el.innerText || "";
+          if (/seleccione una cuenta/i.test(t) && t.length < 3000) {
+            modalRoot = el;
+            break;
+          }
+        }
+        const searchRoot: ParentNode = modalRoot || document;
+        const candidates = Array.from(searchRoot.querySelectorAll<HTMLElement>("label, li, tr, option, [role='option'], [role='radio'], .option, .account-option, div, a, button"));
+        const clpOptions: HTMLElement[] = [];
+        for (const el of candidates) {
+          const t = (el.innerText || "").trim();
+          if (!t) continue;
+          if (!/cuenta (corriente|vista)/i.test(t)) continue;
+          if (/usd|d[oó]lar|moneda extranjera|m\/e/i.test(t)) continue;
+          if (t.length > 200) continue;
+          clpOptions.push(el);
+        }
+        if (clpOptions.length === 0) return { handled: false, reason: "no-clp-option" };
+        const target = clpOptions[0];
+        target.click();
+        for (const inp of Array.from(target.querySelectorAll<HTMLInputElement>("input[type='radio'], input[type='checkbox']"))) {
+          inp.click();
+        }
+        const btnRoot: ParentNode = modalRoot || document;
+        const btns = Array.from(btnRoot.querySelectorAll<HTMLElement>("button, [role='button'], a.btn, a"));
+        for (const btn of btns) {
+          const bt = (btn.innerText || "").trim().toLowerCase();
+          if (/^(aceptar|continuar|seleccionar|confirmar|ver movimientos|ok)$/i.test(bt)) {
+            btn.click();
+            return { handled: true, selected: target.innerText.slice(0, 80), button: bt };
+          }
+        }
+        return { handled: true, selected: target.innerText.slice(0, 80), button: null };
+      });
+      if (modalResult.handled) {
+        debugLog.push(`  [Modal] Picked CLP account: ${modalResult.selected} (button=${modalResult.button})`);
+        await delay(5000);
+      } else if (modalResult.reason && modalResult.reason !== "no-modal") {
+        debugLog.push(`  [Modal] Detected but could not handle: ${modalResult.reason}`);
+      } else {
+        debugLog.push(`  [Modal] No picker modal shown (single account user)`);
+      }
+
+      // Step 7c: on the checking-account landing page, click the tab that
+      // shows the movements. We DELIBERATELY do not call the full
+      // clickNavTarget() here because it matches "estado de cuenta" (which is
+      // the CMR credit-card statement link in the global sidebar) and would
+      // unwind all our progress. This is a safer version that accepts
+      // movement-like tab names while BLOCKING anything mentioning "CMR" or
+      // "credito" or "estado de cuenta".
+      const clickedMovementsTab = await page.evaluate(() => {
+        const ACCEPT = [
+          /saldos? y movimientos/i,
+          /últimos movimientos/i,
+          /\bmovimientos\b/i,
+          /cartola/i,
+        ];
+        const BLOCK = /(cmr|crédito|credito|estado de cuenta|facturad|pagar|transfer|pr[eé]stamo|inversi|seguro)/i;
+        const elements = Array.from(document.querySelectorAll<HTMLElement>("a, button, [role='tab'], [role='menuitem'], li"));
+        const availableTabs: string[] = [];
+        for (const pat of ACCEPT) {
+          for (const el of elements) {
+            const text = (el.innerText || "").trim();
+            if (text.length === 0 || text.length > 60) continue;
+            availableTabs.push(text);
+            if (!pat.test(text)) continue;
+            if (BLOCK.test(text)) continue;
+            const href = (el as HTMLAnchorElement).href || "";
+            if (href.includes("cc-nuevos") || href.includes("comenzar")) continue;
+            el.click();
+            return { clicked: true, text, availableTabs: availableTabs.slice(0, 20) };
+          }
+        }
+        return { clicked: false, availableTabs: availableTabs.slice(0, 20) };
+      });
+      if (clickedMovementsTab.clicked) {
+        debugLog.push(`  [Account] Clicked sub-tab: "${clickedMovementsTab.text}"`);
+        await delay(4000);
+        navigated = true;
+      } else {
+        debugLog.push(`  [Account] No movements sub-tab found. Available tabs: ${clickedMovementsTab.availableTabs.join(" | ")}`);
+        navigated = true;
+      }
+    } else {
+      // Step 7c: No real checking account visible — fall back to the original
+      // clickNavTarget path. This is the correct behaviour for users who only
+      // have a CMR credit card (no checking account at all).
+      debugLog.push(`  [Account] No checking-account product with balance found — falling back to clickNavTarget`);
+      navigated = await clickNavTarget(page, debugLog);
     }
 
     await tryExpandDateRange(page, debugLog);
