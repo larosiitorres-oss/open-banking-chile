@@ -952,67 +952,108 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
       }
     }).catch(() => {});
 
-    // Wait for the auth form's RUT field to render.
+    // Wait for the inline auth drawer to render.
+    //
+    // PATCH (miaufinanzas, ago 2026 redesign): we used to wait for / match "an
+    // input whose placeholder mentions RUT". The drawer's RUT input LOST that
+    // word — it is now `input#document` with placeholder "Ej: 12345678-9" — so
+    // the match started landing on the LOAN CALCULATOR input further down the
+    // public homepage ("Ingresa tu RUT", inside .loanCalculator_wrapper). That
+    // element lives outside the drawer and gets re-rendered, so the captured
+    // handle went stale and `handle.click()` threw "Node is either not clickable
+    // or not an Element" — the login never even started. We now scope every
+    // lookup to the login drawer's own <form> and keep the placeholder match
+    // only as a last resort (explicitly excluding the loan calculator).
     await page.waitForFunction(() => {
-      return Array.from(document.querySelectorAll("input")).some(
-        (i) => (i as HTMLInputElement).offsetParent !== null && /rut/i.test((i as HTMLInputElement).placeholder || ""),
-      );
+      const doc = document.getElementById("document") as HTMLInputElement | null;
+      if (doc && doc.offsetParent !== null) return true;
+      return Array.from(document.querySelectorAll('input[type="password"]'))
+        .some((p) => (p as HTMLInputElement).offsetParent !== null);
     }, { timeout: 15000 }).catch(() => {});
     await delay(800);
     await doSave(page, "02-login-form");
 
-    // 3. Fill RUT into the auth form's RUT field (NOT the search box). Mark it
-    //    with a data attribute so we can grab the exact element handle.
-    debugLog.push("3. Filling RUT...");
+    // 3. Mark the drawer's RUT + clave inputs and its submit button so every
+    //    later step can grab the exact elements by data attribute.
+    debugLog.push("3. Locating login drawer fields...");
     progress("Ingresando RUT...");
     const cleanRut = String(rut).replace(/[.\-]/g, "").toUpperCase();
-    const rutMarked = await page.evaluate(() => {
-      const ins = Array.from(document.querySelectorAll("input")) as HTMLInputElement[];
-      for (const i of ins) {
-        if (i.offsetParent !== null && /rut/i.test(i.placeholder || "")) {
-          i.setAttribute("data-obc-rut", "1");
-          return true;
+    const markLoginFields = () => page.evaluate(() => {
+      const vis = (el: Element | null) => !!el && (el as HTMLElement).offsetParent !== null;
+      for (const a of ["data-obc-rut", "data-obc-pwd", "data-obc-submit"]) {
+        document.querySelectorAll("[" + a + "]").forEach((e) => e.removeAttribute(a));
+      }
+
+      // The login drawer is the form that owns a password field.
+      const forms = Array.from(document.querySelectorAll("form")) as HTMLFormElement[];
+      const drawer =
+        forms.find((f) => /DrawerFormLogin|FormLogin/i.test(f.className || "") && !!f.querySelector('input[type="password"]')) ||
+        forms.find((f) => !!f.querySelector('input[type="password"]:not([type="hidden"])') && vis(f)) ||
+        null;
+      const scope: ParentNode = drawer || document;
+
+      const pwd = (Array.from(scope.querySelectorAll('input[type="password"]')) as HTMLInputElement[])
+        .find((p) => vis(p)) || null;
+
+      // RUT field: #document today; else the drawer's non-password input; else
+      // the text input sharing a form with the password; else placeholder match.
+      let rutEl = (scope.querySelector("input#document") as HTMLInputElement | null);
+      if (!rutEl || !vis(rutEl)) rutEl = null;
+      if (!rutEl && drawer) {
+        rutEl = (Array.from(drawer.querySelectorAll("input")) as HTMLInputElement[])
+          .find((i) => vis(i) && i.type !== "password" && i.type !== "hidden") || null;
+      }
+      if (!rutEl && pwd && pwd.form) {
+        rutEl = (Array.from(pwd.form.querySelectorAll("input")) as HTMLInputElement[])
+          .find((i) => vis(i) && i !== pwd && i.type !== "password" && i.type !== "hidden") || null;
+      }
+      if (!rutEl) {
+        rutEl = (Array.from(document.querySelectorAll("input")) as HTMLInputElement[])
+          .find((i) => vis(i) && /rut/i.test(i.placeholder || "") && !i.closest('[class*="loanCalculator" i]')) || null;
+      }
+
+      // Submit: the old #desktop-login is gone; it is now the drawer's
+      // button[type=submit] ("Ingresar"), disabled until both fields validate.
+      let submit = (document.getElementById("desktop-login") ||
+        document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+      if (!submit && drawer) {
+        submit = drawer.querySelector('button[type="submit"]') as HTMLButtonElement | null;
+        if (!submit) {
+          submit = (Array.from(drawer.querySelectorAll("button")) as HTMLButtonElement[])
+            .find((b) => /ingresar/i.test((b.innerText || "").trim())) || null;
         }
       }
-      return false;
-    });
-    if (!rutMarked) {
-      const ss = await page.screenshot({ encoding: "base64" });
-      return { success: false, bank, accounts: [], error: "No se encontró el campo de RUT (el formulario de ingreso no se abrió)", screenshot: ss as string, debug: debugLog.join("\n") };
-    }
-    const rutHandle = await page.$('input[data-obc-rut="1"]');
 
-    // 4. Locate the Clave Internet field (single-step form; tolerate two-step).
-    //
-    // PATCH (miaufinanzas): the old code checked ONCE, pressed Enter, waited a
-    // fixed 1.2s and checked ONCE more — then gave up with "No se encontró el
-    // campo de clave". On slower machines (the self-hosted MacBook runner) the
-    // inline auth form renders the password input a moment later, so this was
-    // flaky: ~2 of 5 accounts failed per run, and some only succeeded on the
-    // retry. Now we POLL for the field (up to 15s) instead of giving up early.
-    debugLog.push("4. Locating password field...");
-    progress("Ingresando clave...");
-    const markPwd = () => page.evaluate(() => {
-      const ps = Array.from(document.querySelectorAll('input[type="password"]')) as HTMLInputElement[];
-      for (const p of ps) { if (p.offsetParent !== null) { p.setAttribute("data-obc-pwd", "1"); return true; } }
-      return false;
+      if (rutEl) rutEl.setAttribute("data-obc-rut", "1");
+      if (pwd) pwd.setAttribute("data-obc-pwd", "1");
+      if (submit) submit.setAttribute("data-obc-submit", "1");
+      return {
+        rut: !!rutEl, pwd: !!pwd, submit: !!submit,
+        scopedToDrawer: !!drawer,
+        rutId: rutEl ? (rutEl.id || rutEl.placeholder || "?") : "",
+      };
     });
-    let pwdMarked = await markPwd();
-    if (!pwdMarked) {
-      // Some variants reveal the password step only after Enter on the RUT field.
+
+    let marks = await markLoginFields();
+    if (!marks.pwd) {
+      // Some variants reveal the clave step only after Enter on the RUT field.
       await page.keyboard.press("Enter").catch(() => {});
       await page.waitForFunction(() => {
         return Array.from(document.querySelectorAll('input[type="password"]'))
           .some((p) => (p as HTMLInputElement).offsetParent !== null);
       }, { timeout: 15000, polling: 500 }).catch(() => {});
-      pwdMarked = await markPwd();
+      marks = await markLoginFields();
     }
-    debugLog.push(`  Password field found: ${pwdMarked}`);
-    if (!pwdMarked || !rutHandle) {
+    debugLog.push(`  Fields: rut=${marks.rut} (${marks.rutId}) pwd=${marks.pwd} submit=${marks.submit} drawer=${marks.scopedToDrawer}`);
+    if (!marks.rut) {
+      const ss = await page.screenshot({ encoding: "base64" });
+      return { success: false, bank, accounts: [], error: "No se encontró el campo de RUT (el formulario de ingreso no se abrió)", screenshot: ss as string, debug: debugLog.join("\n") };
+    }
+    if (!marks.pwd) {
       const ss = await page.screenshot({ encoding: "base64" });
       return { success: false, bank, accounts: [], error: "No se encontró el campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
     }
-    const pwdHandle = await page.$('input[data-obc-pwd="1"]');
+    let pwdHandle = await page.$('input[data-obc-pwd="1"]');
 
     // Robust fill with READ-BACK verification. Falabella's RUT field auto-formats
     // (inserts the dash) and these React inputs occasionally drop/reorder typed
@@ -1023,7 +1064,18 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     // intended AND the submit button has enabled.
     const expectedPwd = String(password);
     const fillAndRead = async (handle: any, attr: string, value: string): Promise<string> => {
-      await handle.click({ clickCount: 3 });
+      // Focus by DOM first: a coordinate click needs a box model and blows up
+      // ("Node is either not clickable or not an Element") whenever React has
+      // just re-rendered the input.
+      const selected = await page.evaluate((a: string) => {
+        const el = document.querySelector('input[' + a + '="1"]') as HTMLInputElement | null;
+        if (!el) return false;
+        el.focus();
+        el.select?.();
+        return true;
+      }, attr);
+      if (!selected) return "";
+      await handle.click({ clickCount: 3 }).catch(() => {});
       await page.keyboard.press("Backspace").catch(() => {});
       await delay(150);
       await handle.type(value, { delay: 80 });
@@ -1033,37 +1085,45 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
         return el ? el.value : "";
       }, attr);
     };
+    const submitEnabled = () => page.evaluate(() => {
+      const b = document.querySelector('[data-obc-submit="1"]') as HTMLButtonElement | null;
+      return !!b && !b.disabled;
+    });
 
     debugLog.push("4. Filling RUT + clave (with read-back verification)...");
     let filledOk = false;
     for (let attempt = 1; attempt <= 4 && !filledOk; attempt++) {
+      // Re-mark and re-acquire handles on every attempt: these React inputs are
+      // re-rendered as you type, which detaches previously captured handles.
+      if (attempt > 1) marks = await markLoginFields();
+      const rutHandle = await page.$('input[data-obc-rut="1"]');
+      pwdHandle = await page.$('input[data-obc-pwd="1"]');
+      if (!rutHandle || !pwdHandle) { await delay(500); continue; }
+
       const rutVal = await fillAndRead(rutHandle, "data-obc-rut", cleanRut);
       const pwdVal = await fillAndRead(pwdHandle, "data-obc-pwd", expectedPwd);
       const rutMatches = rutVal.replace(/[.\-\s]/g, "").toUpperCase() === cleanRut;
       const pwdMatches = pwdVal === expectedPwd;
       await page.waitForFunction(() => {
-        const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+        const b = document.querySelector('[data-obc-submit="1"]') as HTMLButtonElement | null;
         return !!b && !b.disabled;
       }, { timeout: 4000 }).catch(() => {});
-      const btnEnabled = await page.evaluate(() => {
-        const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
-        return !!b && !b.disabled;
-      });
+      const btnEnabled = await submitEnabled();
       debugLog.push(`  Fill attempt ${attempt}: rutMatch=${rutMatches} pwdLen=${pwdVal.length} pwdMatch=${pwdMatches} btnEnabled=${btnEnabled}`);
       filledOk = rutMatches && pwdMatches && btnEnabled;
     }
 
-    // 5. Submit by clicking the real login button (#desktop-login).
+    // 5. Submit by clicking the drawer's real login button.
     debugLog.push("5. Submitting login...");
     progress("Iniciando sesión...");
     const submitState = await page.evaluate(() => {
-      const b = (document.getElementById("desktop-login") || document.querySelector('[data-testid="desktop-login"]')) as HTMLButtonElement | null;
+      const b = document.querySelector('[data-obc-submit="1"]') as HTMLButtonElement | null;
       if (!b) return "not-found";
       if (b.disabled) return "disabled";
       b.click();
       return "clicked";
     });
-    debugLog.push(`  Submit button (#desktop-login): ${submitState} (fields verified: ${filledOk})`);
+    debugLog.push(`  Submit button: ${submitState} (fields verified: ${filledOk})`);
     if (submitState !== "clicked" && pwdHandle) {
       await pwdHandle.press("Enter");
     }
