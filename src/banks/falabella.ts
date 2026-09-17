@@ -9,7 +9,7 @@ import { closePopups, delay, deduplicateMovements, deduplicateAcrossSources, mon
 import { runScraper } from "../infrastructure/scraper-runner.js";
 import type { BrowserSession } from "../infrastructure/browser.js";
 import { fillRut, fillPassword, clickSubmit } from "../actions/login.js";
-import { clickByText, dismissBanners } from "../actions/navigation.js";
+import { clickByText } from "../actions/navigation.js";
 import { extractAccountMovements } from "../actions/extraction.js";
 import { paginateAndExtract } from "../actions/pagination.js";
 import {
@@ -890,6 +890,42 @@ async function clickNavTarget(page: Page, debugLog: string[]): Promise<boolean> 
 
 // ─── Main scrape function ─────────────────────────────────────────
 
+/**
+ * Falabella-safe banner dismissal.
+ *
+ * PATCH (miaufinanzas, sep 2026): the generic `dismissBanners()` clicks EVERY
+ * button whose text is "entendido"/"aceptar"/"continuar". Banco Falabella's
+ * home now ships a collapsed error modal (`#modal-message`, height 0: "En estos
+ * momentos no lo podemos atender…") whose "Entendido" button RELOADS the page.
+ * It is invisible to a person but `offsetParent !== null`, so the generic
+ * helper pressed it blindly and the reload raced our "Mi cuenta" click: when
+ * the reload landed after the click, the freshly opened drawer was wiped and we
+ * failed with "el formulario de ingreso no se abrió" (~4 of 6 attempts per CI
+ * run). Here we only click buttons a person could actually click: on-screen,
+ * non-zero box, topmost at their centre, and never inside `#modal-message` or
+ * the login drawer itself.
+ */
+async function dismissFalabellaBanners(page: Page): Promise<string[]> {
+  return page.evaluate(() => {
+    const clicked: string[] = [];
+    const vw = window.innerWidth, vh = window.innerHeight;
+    for (const b of Array.from(document.querySelectorAll("button, a")) as HTMLElement[]) {
+      const text = (b.innerText || "").trim().toLowerCase();
+      if (text !== "aceptar" && text !== "entendido" && text !== "continuar") continue;
+      if (b.closest("#modal-message") || b.closest('[class*="DrawerFormLogin"]')) continue;
+      const r = b.getBoundingClientRect();
+      if (r.width < 2 || r.height < 2) continue;
+      const cx = r.x + r.width / 2, cy = r.y + r.height / 2;
+      if (cx < 0 || cy < 0 || cx > vw || cy > vh) continue;
+      const top = document.elementFromPoint(cx, cy);
+      if (!top || !(top === b || b.contains(top))) continue;
+      b.click();
+      clicked.push(text);
+    }
+    return clicked;
+  }).catch(() => [] as string[]);
+}
+
 async function scrapeFalabella(session: BrowserSession, options: ScraperOptions): Promise<ScrapeResult> {
   const { rut, password, saveScreenshots: doScreenshots, owner = "B" } = options;
   const { onProgress } = options;
@@ -905,7 +941,7 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     progress("Abriendo sitio del banco...");
     await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 });
     await delay(2000);
-    await dismissBanners(page);
+    await dismissFalabellaBanners(page);
     // Extra wait for Falabella's Angular SPA to fully initialize before login
     await delay(1000);
     await doSave(page, "01-homepage");
@@ -931,30 +967,89 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     debugLog.push("2. Opening 'Mi cuenta' inline auth form...");
     progress("Abriendo formulario de ingreso...");
 
-    // Dismiss the welcome modal ("Entendido", #btn-login-client-nuevo) and let
-    // dismissBanners clear any cookie/promo banner that could intercept clicks.
-    await page.evaluate(() => {
+    // Dismiss the welcome modal ("Entendido", #btn-login-client-nuevo) and any
+    // REAL on-screen cookie/promo banner (see dismissFalabellaBanners).
+    const dismissWelcome = () => page.evaluate(() => {
       const el = document.getElementById("btn-login-client-nuevo");
       if (el) (el as HTMLElement).click();
     }).catch(() => {});
-    await dismissBanners(page).catch(() => {});
+    await dismissWelcome();
+    const dismissed0 = await dismissFalabellaBanners(page);
+    if (dismissed0.length) debugLog.push(`  Dismissed banners: ${dismissed0.join(", ")}`);
     await delay(500);
 
-    // Open the auth widget via a DOM click (bypasses any visual overlay).
-    await page.evaluate(() => {
-      const byId = document.getElementById("btn-auth-normal");
-      if (byId) { (byId as HTMLElement).click(); return; }
-      for (const b of Array.from(document.querySelectorAll("button, a"))) {
-        if (((b as HTMLElement).innerText || "").trim().toLowerCase() === "mi cuenta") {
-          (b as HTMLElement).click();
-          return;
+    // Is the inline login drawer showing? (#document is its RUT input; else any
+    // visible password input — see the field notes further down.)
+    const drawerVisible = () => page.evaluate(() => {
+      const doc = document.getElementById("document") as HTMLInputElement | null;
+      if (doc && doc.offsetParent !== null) return true;
+      return Array.from(document.querySelectorAll('input[type="password"]'))
+        .some((p) => (p as HTMLInputElement).offsetParent !== null);
+    }).catch(() => false);
+
+    // PATCH (miaufinanzas, sep 2026): opening the drawer was flaky in CI. The
+    // "Mi cuenta" click was fired ONCE; when it landed before the React app had
+    // hydrated (attached its handlers) nothing happened, the public home stayed
+    // put, and ~40s later we failed with "el formulario de ingreso no se abrió".
+    // Roughly 4 of 6 attempts per run died like that (the CMR only got through
+    // on its retry). Now we click, wait a few seconds for the drawer, and click
+    // again — alternating a DOM click with a real mouse click — for up to ~45s.
+    // Trigger: #btn-auth-normal (legacy id) or the header button "Mi cuenta".
+    await page.waitForFunction(() => {
+      if (document.readyState !== "complete") return false;
+      if (document.getElementById("btn-auth-normal")) return true;
+      return Array.from(document.querySelectorAll("button, a"))
+        .some((b) => ((b as HTMLElement).innerText || "").trim().toLowerCase() === "mi cuenta");
+    }, { timeout: 15000, polling: 500 }).catch(() => {});
+
+    let drawerOpen = await drawerVisible();
+    for (let attempt = 1; attempt <= 8 && !drawerOpen; attempt++) {
+      await dismissWelcome();
+      await dismissFalabellaBanners(page);
+      const trigger = await page.evaluate(() => {
+        document.querySelectorAll("[data-obc-login-trigger]").forEach((e) => e.removeAttribute("data-obc-login-trigger"));
+        const isMiCuenta = (b: Element) => ((b as HTMLElement).innerText || "").trim().toLowerCase() === "mi cuenta";
+        const all = Array.from(document.querySelectorAll("button, a"));
+        const el = document.getElementById("btn-auth-normal")
+          || all.find((b) => (b as HTMLElement).offsetParent !== null && isMiCuenta(b))
+          || all.find(isMiCuenta)
+          || null;
+        if (!el) return "";
+        el.setAttribute("data-obc-login-trigger", "1");
+        const cls = String(el.className || "").split(/\s+/)[0] || "";
+        return el.tagName.toLowerCase() + (el.id ? "#" + el.id : "") + (cls ? "." + cls : "");
+      }).catch(() => "");
+      let method = "none";
+      if (trigger) {
+        const domClick = () => page.evaluate(() => {
+          (document.querySelector('[data-obc-login-trigger="1"]') as HTMLElement | null)?.click();
+        }).catch(() => {});
+        if (attempt % 2 === 0) {
+          // Real mouse click: scrolls into view and goes through the browser's
+          // input pipeline exactly like a person clicking.
+          method = "mouse";
+          await page.click('[data-obc-login-trigger="1"]').catch(async () => {
+            method = "dom(fallback)";
+            await domClick();
+          });
+        } else {
+          method = "dom";
+          await domClick();
         }
       }
-    }).catch(() => {});
+      await page.waitForFunction(() => {
+        const doc = document.getElementById("document") as HTMLInputElement | null;
+        if (doc && doc.offsetParent !== null) return true;
+        return Array.from(document.querySelectorAll('input[type="password"]'))
+          .some((p) => (p as HTMLInputElement).offsetParent !== null);
+      }, { timeout: 5000, polling: 250 }).catch(() => {});
+      drawerOpen = await drawerVisible();
+      debugLog.push(`  Open attempt ${attempt}: trigger=${trigger || "NOT FOUND"} via ${method} -> drawer=${drawerOpen}`);
+    }
+    await delay(800);
+    await doSave(page, "02-login-form");
 
-    // Wait for the inline auth drawer to render.
-    //
-    // PATCH (miaufinanzas, ago 2026 redesign): we used to wait for / match "an
+    // Field notes — PATCH (miaufinanzas, ago 2026 redesign): we used to match "an
     // input whose placeholder mentions RUT". The drawer's RUT input LOST that
     // word — it is now `input#document` with placeholder "Ej: 12345678-9" — so
     // the match started landing on the LOAN CALCULATOR input further down the
@@ -964,14 +1059,6 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     // or not an Element" — the login never even started. We now scope every
     // lookup to the login drawer's own <form> and keep the placeholder match
     // only as a last resort (explicitly excluding the loan calculator).
-    await page.waitForFunction(() => {
-      const doc = document.getElementById("document") as HTMLInputElement | null;
-      if (doc && doc.offsetParent !== null) return true;
-      return Array.from(document.querySelectorAll('input[type="password"]'))
-        .some((p) => (p as HTMLInputElement).offsetParent !== null);
-    }, { timeout: 15000 }).catch(() => {});
-    await delay(800);
-    await doSave(page, "02-login-form");
 
     // 3. Mark the drawer's RUT + clave inputs and its submit button so every
     //    later step can grab the exact elements by data attribute.
