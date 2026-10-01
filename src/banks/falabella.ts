@@ -964,6 +964,62 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     //                   dash, e.g. "111111111" -> "11111111-1".
     //   - Clave field:  input[type=password] placeholder "Clave Internet", max 6.
     //   - Submit:       #desktop-login, `disabled` until both fields validate.
+    // PATCH (miaufinanzas, oct 2026) — el escudo del banco y el "UNKNOWN_ERROR".
+    //
+    // El submit hace, desde el navegador, un POST cross-origin a
+    //   https://bff.bancofalabella.cl/login/v2/authentication-web
+    // precedido por su preflight OPTIONS. Desde ~fines de sep 2026 Cloudflare
+    // responde 403 al PREFLIGHT cuando la IP es "nueva" (los runners de GitHub
+    // Actions siempre lo son): el POST ni siquiera sale (net::ERR_FAILED), el
+    // sitio rebota a ?errorMessage=UNKNOWN_ERROR y muestra "En estos momentos no
+    // lo podemos atender". RUT y clave NO llegaron al banco. Medido con la sonda
+    // sin credenciales (miaufinanzas: bank-probe-falabella.yml): tras ~40–90 s y
+    // 1–2 envíos bloqueados en la MISMA sesión, el preflight pasa a 200.
+    //
+    // Por eso el login es un bucle: si hay evidencia positiva de que el escudo
+    // bloqueó el envío (preflight 403/429 o POST fallido, y ninguna respuesta
+    // del POST), se espera y se reenvía en la misma sesión. Reenviar es seguro
+    // para la cuenta: el banco nunca vio el intento. Si el POST SÍ obtuvo
+    // respuesta (p. ej. HTTP 500), es el banco quien rechazó y no se insiste.
+    const shield = { preflightStatus: 0, postStatus: 0, postBody: "", postFailed: "" };
+    const resetShield = () => { shield.preflightStatus = 0; shield.postStatus = 0; shield.postBody = ""; shield.postFailed = ""; };
+    const isLoginApiCall = (url: string) => /\/login\/[^?]*authentication/i.test(url);
+    const onLoginResponse = async (res: any) => {
+      try {
+        if (!isLoginApiCall(res.url())) return;
+        const method = res.request().method();
+        if (method === "OPTIONS") { shield.preflightStatus = res.status(); return; }
+        if (method !== "POST") return;
+        shield.postStatus = res.status();
+        // Body only on failures (successful responses carry tokens), masked.
+        if (res.status() >= 400) {
+          shield.postBody = (await res.text().catch(() => "")).replace(/\s+/g, " ").replace(/\d{7,}/g, "***").slice(0, 160);
+        }
+      } catch { /* diagnostics only */ }
+    };
+    const onLoginRequestFailed = (req: any) => {
+      try {
+        if (req.method() === "POST" && isLoginApiCall(req.url())) shield.postFailed = req.failure()?.errorText || "failed";
+      } catch { /* diagnostics only */ }
+    };
+    page.on("response", onLoginResponse);
+    page.on("requestfailed", onLoginRequestFailed);
+    const shieldBlocked = () =>
+      !shield.postStatus
+      && (shield.preflightStatus === 403 || shield.preflightStatus === 429 || !!shield.postFailed)
+      && /[?&]errorMessage=/i.test(page.url());
+    const loginApiSummary = () =>
+      shield.postStatus
+        ? `HTTP ${shield.postStatus}${shield.postBody ? ` ${shield.postBody}` : ""}`
+        : shield.postFailed || shield.preflightStatus
+          ? `sin respuesta (preflight ${shield.preflightStatus || "?"}${shield.postFailed ? `, ${shield.postFailed}` : ""})`
+          : "sin llamada observada";
+
+    let filledOk = false;
+    let pwdHandle: any = null;
+    // One pass of steps 2–5: open the drawer, fill, submit and wait. Returns a
+    // failure result to abort the scrape, or null to continue to verification.
+    const submitLoginOnce = async (): Promise<ScrapeResult | null> => {
     debugLog.push("2. Opening 'Mi cuenta' inline auth form...");
     progress("Abriendo formulario de ingreso...");
 
@@ -1140,7 +1196,7 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
       const ss = await page.screenshot({ encoding: "base64" });
       return { success: false, bank, accounts: [], error: "No se encontró el campo de clave", screenshot: ss as string, debug: debugLog.join("\n") };
     }
-    let pwdHandle = await page.$('input[data-obc-pwd="1"]');
+    pwdHandle = await page.$('input[data-obc-pwd="1"]');
 
     // Robust fill with READ-BACK verification. Falabella's RUT field auto-formats
     // (inserts the dash) and these React inputs occasionally drop/reorder typed
@@ -1178,7 +1234,7 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     });
 
     debugLog.push("4. Filling RUT + clave (with read-back verification)...");
-    let filledOk = false;
+    filledOk = false;
     for (let attempt = 1; attempt <= 4 && !filledOk; attempt++) {
       // Re-mark and re-acquire handles on every attempt: these React inputs are
       // re-rendered as you type, which detaches previously captured handles.
@@ -1203,22 +1259,6 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     // 5. Submit by clicking the drawer's real login button.
     debugLog.push("5. Submitting login...");
     progress("Iniciando sesión...");
-    // Record what the bank's login API answers (bff…/login/v2/authentication-web).
-    // The public site only shows a generic "?errorMessage=UNKNOWN_ERROR"; the HTTP
-    // status tells apart a backend failure (5xx) from a WAF/anti-bot block (403)
-    // or a plain rejection (401). Status only on success — bodies carry tokens.
-    let loginApi = "";
-    const onLoginResponse = async (res: any) => {
-      try {
-        if (res.request().method() !== "POST" || !/\/login\/[^?]*authentication/i.test(res.url())) return;
-        loginApi = `HTTP ${res.status()}`;
-        if (res.status() >= 400) {
-          const body = (await res.text().catch(() => "")).replace(/\s+/g, " ").replace(/\d{7,}/g, "***").slice(0, 160);
-          if (body) loginApi += ` ${body}`;
-        }
-      } catch { /* diagnostics only */ }
-    };
-    page.on("response", onLoginResponse);
     const submitState = await page.evaluate(() => {
       const b = document.querySelector('[data-obc-submit="1"]') as HTMLButtonElement | null;
       if (!b) return "not-found";
@@ -1234,6 +1274,29 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     // Wait for the post-login transition (SPA navigation or DOM swap).
     await page.waitForNavigation({ waitUntil: "networkidle2", timeout: 25000 }).catch(() => {});
     await delay(5000);
+    return null;
+    };
+
+    const MAX_LOGIN_ROUNDS = 6;
+    const SHIELD_WAIT_MS = 25_000;
+    let loginRounds = 0;
+    for (let round = 1; round <= MAX_LOGIN_ROUNDS; round++) {
+      if (round > 1) {
+        debugLog.push(`  Shield: el escudo bloqueó el envío (${loginApiSummary()}); las credenciales no salieron del navegador. Esperando ${SHIELD_WAIT_MS / 1000}s y reenviando (ronda ${round}/${MAX_LOGIN_ROUNDS})...`);
+        progress("El banco está limitando el acceso; reintentando...");
+        await delay(SHIELD_WAIT_MS);
+        // Back to a clean home (same session/cookies) — the bounce left the
+        // "no lo podemos atender" modal open.
+        await page.goto(BANK_URL, { waitUntil: "networkidle2", timeout: 30000 }).catch(() => {});
+        await delay(2000);
+      }
+      resetShield();
+      loginRounds = round;
+      const aborted = await submitLoginOnce();
+      if (aborted) return aborted;
+      debugLog.push(`  Login API (ronda ${round}): ${loginApiSummary()}`);
+      if (!shieldBlocked()) break;
+    }
     await doSave(page, "03-after-login");
 
     await closePopups(page).catch(() => {});
@@ -1279,10 +1342,18 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
         try { return new URL(loginEvidence.url).searchParams.get("errorMessage") || ""; } catch { return ""; }
       })();
       if (bankCode) {
-        debugLog.push(`6. Bank rejected the login: errorMessage=${bankCode} | login API: ${loginApi || "sin respuesta capturada"}`);
+        debugLog.push(`6. Bank rejected the login: errorMessage=${bankCode} | login API: ${loginApiSummary()} | rondas: ${loginRounds}`);
         const ss = await page.screenshot({ encoding: "base64" });
-        const httpStatus = (loginApi.match(/^HTTP \d+/) || [""])[0];
-        const detail = httpStatus ? `${bankCode}, ${httpStatus}` : bankCode;
+        if (shieldBlocked()) {
+          // Every round was stopped at the preflight: this is the network/WAF,
+          // not the account. Callers may retry freely — nothing reached the bank.
+          return {
+            success: false, bank, accounts: [],
+            error: `El escudo anti-bots del banco bloqueó la llamada de ingreso desde esta red (preflight ${shield.preflightStatus || "sin respuesta"} en ${loginRounds} envíos); las credenciales no llegaron a enviarse.`,
+            screenshot: ss as string, debug: debugLog.join("\n"),
+          };
+        }
+        const detail = shield.postStatus ? `${bankCode}, HTTP ${shield.postStatus}` : bankCode;
         const error = /USER_OR_PASSWORD_NOT_VALID/i.test(bankCode)
           ? `El banco rechazó el RUT o la clave (${detail}).`
           : `El banco rechazó el ingreso automatizado (${detail}).`;
@@ -1310,7 +1381,8 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     }
 
     page.off("response", onLoginResponse);
-    debugLog.push(`6. Login OK! (verified)${loginApi ? ` [login API: ${loginApi}]` : ""}`);
+    page.off("requestfailed", onLoginRequestFailed);
+    debugLog.push(`6. Login OK! (verified) [login API: ${loginApiSummary()}, rondas: ${loginRounds}]`);
     progress("Sesión iniciada correctamente");
     await doSave(page, "04-post-login");
 
