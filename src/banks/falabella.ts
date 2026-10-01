@@ -1249,6 +1249,27 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
 
     if (!loggedIn) {
       // Not authenticated — diagnose why so the connection shows a useful error.
+      //
+      // PATCH (miaufinanzas, oct 2026): the bank reports a rejected login by
+      // bouncing to the public home with `?errorMessage=<CODE>`. Read that code
+      // FIRST. Before this, the bounce fell through to the 2FA heuristic below,
+      // which matches because the public home's menus mention "clave dinámica":
+      // an anti-bot rejection (UNKNOWN_ERROR) was reported as "El banco pide
+      // clave dinámica (2FA)" and the caller retried — a second rejected login
+      // for a RUT the bank was already flagging.
+      //   USER_OR_PASSWORD_NOT_VALID → the bank says RUT/clave are wrong.
+      //   anything else (UNKNOWN_ERROR…) → the bank refused the automated login.
+      const bankCode = (() => {
+        try { return new URL(loginEvidence.url).searchParams.get("errorMessage") || ""; } catch { return ""; }
+      })();
+      if (bankCode) {
+        debugLog.push(`6. Bank rejected the login: errorMessage=${bankCode}`);
+        const ss = await page.screenshot({ encoding: "base64" });
+        const error = /USER_OR_PASSWORD_NOT_VALID/i.test(bankCode)
+          ? `El banco rechazó el RUT o la clave (${bankCode}).`
+          : `El banco rechazó el ingreso automatizado (${bankCode}).`;
+        return { success: false, bank, accounts: [], error, screenshot: ss as string, debug: debugLog.join("\n") };
+      }
       const pageContent = (await page.content()).toLowerCase();
       if (/clave din[aá]mica|segundo factor|c[oó]digo de verificaci[oó]n/.test(pageContent)) {
         const ss = await page.screenshot({ encoding: "base64" });
