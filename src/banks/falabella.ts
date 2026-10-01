@@ -1277,7 +1277,10 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     return null;
     };
 
-    const MAX_LOGIN_ROUNDS = 6;
+    // Medido con la sonda (9 runners, 1-oct-2026): el escudo abrió a los 23, 40,
+    // 73, 73, 89, 169, 172 y 176 s; en un runner seguía cerrado a los 236 s.
+    // 8 rondas (~40 s c/u) cubren ~5 min; si no alcanza, quien llama reintenta.
+    const MAX_LOGIN_ROUNDS = 8;
     const SHIELD_WAIT_MS = 25_000;
     let loginRounds = 0;
     for (let round = 1; round <= MAX_LOGIN_ROUNDS; round++) {
