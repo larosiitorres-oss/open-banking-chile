@@ -1203,6 +1203,22 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
     // 5. Submit by clicking the drawer's real login button.
     debugLog.push("5. Submitting login...");
     progress("Iniciando sesión...");
+    // Record what the bank's login API answers (bff…/login/v2/authentication-web).
+    // The public site only shows a generic "?errorMessage=UNKNOWN_ERROR"; the HTTP
+    // status tells apart a backend failure (5xx) from a WAF/anti-bot block (403)
+    // or a plain rejection (401). Status only on success — bodies carry tokens.
+    let loginApi = "";
+    const onLoginResponse = async (res: any) => {
+      try {
+        if (res.request().method() !== "POST" || !/\/login\/[^?]*authentication/i.test(res.url())) return;
+        loginApi = `HTTP ${res.status()}`;
+        if (res.status() >= 400) {
+          const body = (await res.text().catch(() => "")).replace(/\s+/g, " ").replace(/\d{7,}/g, "***").slice(0, 160);
+          if (body) loginApi += ` ${body}`;
+        }
+      } catch { /* diagnostics only */ }
+    };
+    page.on("response", onLoginResponse);
     const submitState = await page.evaluate(() => {
       const b = document.querySelector('[data-obc-submit="1"]') as HTMLButtonElement | null;
       if (!b) return "not-found";
@@ -1263,11 +1279,13 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
         try { return new URL(loginEvidence.url).searchParams.get("errorMessage") || ""; } catch { return ""; }
       })();
       if (bankCode) {
-        debugLog.push(`6. Bank rejected the login: errorMessage=${bankCode}`);
+        debugLog.push(`6. Bank rejected the login: errorMessage=${bankCode} | login API: ${loginApi || "sin respuesta capturada"}`);
         const ss = await page.screenshot({ encoding: "base64" });
+        const httpStatus = (loginApi.match(/^HTTP \d+/) || [""])[0];
+        const detail = httpStatus ? `${bankCode}, ${httpStatus}` : bankCode;
         const error = /USER_OR_PASSWORD_NOT_VALID/i.test(bankCode)
-          ? `El banco rechazó el RUT o la clave (${bankCode}).`
-          : `El banco rechazó el ingreso automatizado (${bankCode}).`;
+          ? `El banco rechazó el RUT o la clave (${detail}).`
+          : `El banco rechazó el ingreso automatizado (${detail}).`;
         return { success: false, bank, accounts: [], error, screenshot: ss as string, debug: debugLog.join("\n") };
       }
       const pageContent = (await page.content()).toLowerCase();
@@ -1291,7 +1309,8 @@ async function scrapeFalabella(session: BrowserSession, options: ScraperOptions)
       };
     }
 
-    debugLog.push("6. Login OK! (verified)");
+    page.off("response", onLoginResponse);
+    debugLog.push(`6. Login OK! (verified)${loginApi ? ` [login API: ${loginApi}]` : ""}`);
     progress("Sesión iniciada correctamente");
     await doSave(page, "04-post-login");
 
